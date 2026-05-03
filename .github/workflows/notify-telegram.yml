@@ -1,0 +1,59 @@
+name: Notify Telegram
+
+on:
+  workflow_call:
+    inputs:
+      message:
+        description: 'Message to send (Markdown)'
+        required: true
+        type: string
+      button_text:
+        description: 'Inline keyboard button label (optional)'
+        required: false
+        type: string
+        default: ''
+      button_url:
+        description: 'Inline keyboard button URL (optional)'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      TELEGRAM_CHAT_ID:
+        required: true
+      TELEGRAM_BOT_TOKEN:
+        required: true
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram Notification
+        run: |
+          if [ -n "${{ inputs.button_url }}" ]; then
+            jq -n \
+              --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
+              --arg text "${{ inputs.message }}" \
+              --arg btn_text "${{ inputs.button_text }}" \
+              --arg btn_url "${{ inputs.button_url }}" \
+              '{
+                chat_id: $chat_id,
+                text: $text,
+                parse_mode: "Markdown",
+                reply_markup: {
+                  inline_keyboard: [[{ text: $btn_text, url: $btn_url }]]
+                }
+              }' > payload.json
+          else
+            jq -n \
+              --arg chat_id "${{ secrets.TELEGRAM_CHAT_ID }}" \
+              --arg text "${{ inputs.message }}" \
+              '{
+                chat_id: $chat_id,
+                text: $text,
+                parse_mode: "Markdown"
+              }' > payload.json
+          fi
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d @payload.json

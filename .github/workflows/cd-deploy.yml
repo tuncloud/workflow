@@ -1,0 +1,219 @@
+name: CD - Deploy to TunCloud K8s
+
+on:
+  workflow_call:
+    inputs:
+      namespace:
+        description: 'Kubernetes namespace'
+        required: true
+        type: string
+      deployment-name:
+        description: 'Kubernetes deployment name (also the image name base)'
+        required: true
+        type: string
+      image-tag:
+        description: 'Image tag to roll out. Only used when deployment-type is rollout/deploy.'
+        required: false
+        type: string
+        default: 'latest'
+      deployment-type:
+        description: 'rollout (update image) or restart (rolling restart without image change)'
+        required: false
+        type: string
+        default: 'rollout'
+      targets:
+        description: |
+          Comma-separated container names that match the CI targets.
+          Empty = single container named after deployment-name.
+          e.g. "api,worker" updates containers api and worker using images
+               {deployment-name}-api and {deployment-name}-worker
+        required: false
+        type: string
+        default: ''
+      registry:
+        description: 'Container registry host. Empty = Docker Hub.'
+        required: false
+        type: string
+        default: ''
+      registry-namespace:
+        description: 'Registry namespace/org. Empty = use TUNCLOUD_REGISTRY_USERNAME secret.'
+        required: false
+        type: string
+        default: ''
+      notify:
+        description: 'Send Telegram notification on success and failure'
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      KUBECONFIG:
+        required: true
+      CF_ACCESS_CLIENT_ID:
+        required: true
+      CF_ACCESS_CLIENT_SECRET:
+        required: true
+      K8S_API_URL:
+        required: true
+      # Used to resolve the default registry namespace when registry-namespace input is empty
+      TUNCLOUD_REGISTRY_USERNAME:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+      TELEGRAM_BOT_TOKEN:
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Install cloudflared
+        run: |
+          curl -sSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/
+
+      - name: Start Cloudflare Tunnel proxy
+        env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          K8S_API_URL: ${{ secrets.K8S_API_URL }}
+        run: |
+          cloudflared access tcp --hostname "$K8S_API_URL" --url localhost:6443 &
+          sleep 3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Execute deployment
+        id: k8s
+        env:
+          DEPLOYMENT_TYPE: ${{ inputs.deployment-type }}
+          NAMESPACE: ${{ inputs.namespace }}
+          DEPLOYMENT_NAME: ${{ inputs.deployment-name }}
+          TAG: ${{ inputs.image-tag }}
+          TARGETS: ${{ inputs.targets }}
+          REGISTRY: ${{ inputs.registry }}
+          REGISTRY_NAMESPACE: ${{ inputs.registry-namespace || secrets.TUNCLOUD_REGISTRY_USERNAME }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          # "deploy" is accepted as a synonym for "rollout" (backward compat)
+          if [ "$DEPLOYMENT_TYPE" = "restart" ]; then
+            echo "🔄 Restarting ${DEPLOYMENT_NAME} in namespace ${NAMESPACE}..."
+            kubectl rollout restart deployment/"${DEPLOYMENT_NAME}" -n "${NAMESPACE}"
+          else
+            PREFIX=""
+            [ -n "$REGISTRY" ] && PREFIX="${REGISTRY}/"
+
+            IMAGE_ARGS=""
+            if [ -z "$TARGETS" ]; then
+              IMAGE_ARGS="${DEPLOYMENT_NAME}=${PREFIX}${REGISTRY_NAMESPACE}/${DEPLOYMENT_NAME}:${TAG}"
+            else
+              IFS=',' read -ra LIST <<< "$TARGETS"
+              for t in "${LIST[@]}"; do
+                t="${t// /}"   # trim whitespace
+                IMAGE_ARGS="${IMAGE_ARGS} ${t}=${PREFIX}${REGISTRY_NAMESPACE}/${DEPLOYMENT_NAME}-${t}:${TAG}"
+              done
+            fi
+
+            echo "🚀 Rolling out ${DEPLOYMENT_NAME} with tag ${TAG}..."
+            # shellcheck disable=SC2086
+            kubectl set image deployment/"${DEPLOYMENT_NAME}" ${IMAGE_ARGS} -n "${NAMESPACE}"
+            kubectl annotate deployment/"${DEPLOYMENT_NAME}" \
+              -n "${NAMESPACE}" \
+              kubernetes.io/change-cause="Deployed ${TAG} via GitHub Actions run #${RUN_NUMBER}" \
+              --overwrite
+          fi
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/${{ inputs.deployment-name }} \
+            -n ${{ inputs.namespace }} \
+            --timeout=300s
+
+      - name: Verify deployment
+        run: |
+          echo "=== Deployment ==="
+          kubectl get deployment ${{ inputs.deployment-name }} -n ${{ inputs.namespace }}
+          echo ""
+          echo "=== Pods ==="
+          kubectl get pods -n ${{ inputs.namespace }} -l app=${{ inputs.deployment-name }}
+          echo ""
+          echo "=== Rollout History ==="
+          kubectl rollout history deployment/${{ inputs.deployment-name }} -n ${{ inputs.namespace }} | tail -5
+
+      - name: Rollback on failure
+        if: failure() && inputs.deployment-type != 'restart'
+        run: |
+          echo "❌ Deployment failed, initiating rollback..."
+          kubectl rollout undo deployment/${{ inputs.deployment-name }} -n ${{ inputs.namespace }}
+          kubectl rollout status deployment/${{ inputs.deployment-name }} -n ${{ inputs.namespace }} --timeout=300s
+
+      - name: Send success notification
+        if: ${{ inputs.notify == true && success() }}
+        env:
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ACTION: ${{ inputs.deployment-type }}
+          TAG: ${{ inputs.image-tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          ACTION_LABEL="Deployment"
+          [ "$ACTION" = "restart" ] && ACTION_LABEL="Restart"
+
+          TAG_LINE=""
+          [ "$ACTION" != "restart" ] && TAG_LINE="*Tag:* \`${TAG}\`"
+
+          TEXT="✅ *${ACTION_LABEL} Successful\!*
+
+          *Repository:* ${REPO}
+          ${TAG_LINE}
+          *Status:* Completed successfully 🚀"
+
+          jq -n \
+            --arg chat_id "$CHAT_ID" \
+            --arg text "$TEXT" \
+            '{ chat_id: $chat_id, text: $text, parse_mode: "Markdown" }' | \
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d @-
+
+      - name: Send failure notification
+        if: ${{ inputs.notify == true && failure() }}
+        env:
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ACTION: ${{ inputs.deployment-type }}
+          TAG: ${{ inputs.image-tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          ACTION_LABEL="Deployment"
+          [ "$ACTION" = "restart" ] && ACTION_LABEL="Restart"
+
+          if [ "$ACTION" != "restart" ]; then
+            TAG_LINE="*Tag:* \`${TAG}\`
+          *Action:* Rollback initiated."
+          else
+            TAG_LINE="*Action:* Please check the logs."
+          fi
+
+          TEXT="❌ *${ACTION_LABEL} Failed\!*
+
+          *Repository:* ${REPO}
+          ${TAG_LINE}"
+
+          jq -n \
+            --arg chat_id "$CHAT_ID" \
+            --arg text "$TEXT" \
+            '{ chat_id: $chat_id, text: $text, parse_mode: "Markdown" }' | \
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d @-

@@ -1,0 +1,240 @@
+name: CI - Build and Push
+
+on:
+  workflow_call:
+    inputs:
+      deployment-name:
+        description: 'Deployment name, used as Docker image name'
+        required: true
+        type: string
+      targets:
+        description: |
+          Comma-separated Docker build --target values.
+          Empty = single image with no --target flag.
+          e.g. "api,worker" builds {deployment-name}-api and {deployment-name}-worker
+        required: false
+        type: string
+        default: ''
+      dockerfile:
+        required: false
+        type: string
+        default: 'Dockerfile'
+      context:
+        required: false
+        type: string
+        default: '.'
+      registry:
+        description: 'Container registry host (e.g. ghcr.io). Empty = Docker Hub.'
+        required: false
+        type: string
+        default: ''
+      registry-namespace:
+        description: 'Registry namespace/org. Empty = use TunCloud default (TUNCLOUD_REGISTRY_USERNAME).'
+        required: false
+        type: string
+        default: ''
+      runner:
+        description: 'GitHub Actions runner label'
+        required: false
+        type: string
+        default: 'ubuntu-24.04-arm'
+      bump:
+        description: 'Semver bump strategy: auto (conventional commits), patch, minor, major'
+        required: false
+        type: string
+        default: 'auto'
+      notify:
+        description: 'Send Telegram notification after successful push'
+        required: false
+        type: boolean
+        default: false
+      notify-button-text:
+        description: 'Inline button label in the Telegram notification'
+        required: false
+        type: string
+        default: ''
+      notify-button-url:
+        description: 'Inline button URL in the Telegram notification'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      # Override TunCloud defaults with a custom registry
+      REGISTRY_USERNAME:
+        required: false
+      REGISTRY_TOKEN:
+        required: false
+      # TunCloud org-level secrets (used when no override is supplied)
+      TUNCLOUD_REGISTRY_USERNAME:
+        required: false
+      TUNCLOUD_REGISTRY_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+      TELEGRAM_BOT_TOKEN:
+        required: false
+    outputs:
+      tag:
+        description: 'Semantic version tag that was created (e.g. v1.2.3)'
+        value: ${{ jobs.build-push.outputs.tag }}
+
+jobs:
+  build-push:
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: write   # required to create & push git tags
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history needed for conventional-commit analysis
+
+      - name: Determine next version
+        id: version
+        run: |
+          git fetch --tags --quiet
+
+          LATEST=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname | head -1)
+
+          if [ -z "$LATEST" ]; then
+            NEXT="v0.1.0"
+          else
+            VERSION="${LATEST#v}"
+            MAJOR=$(echo "$VERSION" | cut -d. -f1)
+            MINOR=$(echo "$VERSION" | cut -d. -f2)
+            PATCH=$(echo "$VERSION" | cut -d. -f3)
+
+            BUMP="${{ inputs.bump }}"
+            if [ "$BUMP" = "auto" ]; then
+              COMMITS=$(git log "${LATEST}..HEAD" --pretty=format:"%s" 2>/dev/null || true)
+              if echo "$COMMITS" | grep -qE "BREAKING[- ]CHANGE|^[a-z]+(\(.+\))?!:"; then
+                NEXT="v$((MAJOR+1)).0.0"
+              elif echo "$COMMITS" | grep -qE "^feat(\(.+\))?:"; then
+                NEXT="v${MAJOR}.$((MINOR+1)).0"
+              else
+                NEXT="v${MAJOR}.${MINOR}.$((PATCH+1))"
+              fi
+            elif [ "$BUMP" = "major" ]; then
+              NEXT="v$((MAJOR+1)).0.0"
+            elif [ "$BUMP" = "minor" ]; then
+              NEXT="v${MAJOR}.$((MINOR+1)).0"
+            else
+              NEXT="v${MAJOR}.${MINOR}.$((PATCH+1))"
+            fi
+          fi
+
+          echo "tag=${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "Next version: ${NEXT}"
+
+      - name: Create and push git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Resolve registry credentials
+        id: reg
+        run: |
+          USERNAME="${{ secrets.REGISTRY_USERNAME }}"
+          TOKEN="${{ secrets.REGISTRY_TOKEN }}"
+          [ -z "$USERNAME" ] && USERNAME="${{ secrets.TUNCLOUD_REGISTRY_USERNAME }}"
+          [ -z "$TOKEN" ]    && TOKEN="${{ secrets.TUNCLOUD_REGISTRY_TOKEN }}"
+
+          NAMESPACE="${{ inputs.registry-namespace }}"
+          [ -z "$NAMESPACE" ] && NAMESPACE="$USERNAME"
+
+          echo "username=${USERNAME}" >> "$GITHUB_OUTPUT"
+          echo "token=${TOKEN}"       >> "$GITHUB_OUTPUT"
+          echo "namespace=${NAMESPACE}" >> "$GITHUB_OUTPUT"
+
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ steps.reg.outputs.username }}
+          password: ${{ steps.reg.outputs.token }}
+
+      - name: Build and push images
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          NAMESPACE: ${{ steps.reg.outputs.namespace }}
+          NAME: ${{ inputs.deployment-name }}
+          TAG: ${{ steps.version.outputs.tag }}
+          TARGETS: ${{ inputs.targets }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+        run: |
+          PREFIX=""
+          [ -n "$REGISTRY" ] && PREFIX="${REGISTRY}/"
+
+          build_and_push() {
+            local target="$1"
+            local suffix="$2"
+            local image="${PREFIX}${NAMESPACE}/${NAME}${suffix}"
+
+            ARGS="--file ${DOCKERFILE}"
+            [ -n "$target" ] && ARGS="${ARGS} --target ${target}"
+            ARGS="${ARGS} -t ${image}:${TAG} -t ${image}:latest"
+
+            echo "Building ${image}:${TAG} ..."
+            # shellcheck disable=SC2086
+            docker build ${ARGS} "${CONTEXT}"
+            docker push "${image}:${TAG}"
+            docker push "${image}:latest"
+          }
+
+          if [ -z "$TARGETS" ]; then
+            build_and_push "" ""
+          else
+            IFS=',' read -ra LIST <<< "$TARGETS"
+            for t in "${LIST[@]}"; do
+              t="${t// /}"   # trim whitespace
+              build_and_push "$t" "-${t}"
+            done
+          fi
+
+      - name: Send Telegram notification
+        if: ${{ inputs.notify == true }}
+        env:
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          BTN_TEXT: ${{ inputs.notify-button-text }}
+          BTN_URL: ${{ inputs.notify-button-url }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          TAG: ${{ steps.version.outputs.tag }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          TEXT="✅ *Build \& Push Successful\!*
+
+          *Repository:* ${REPO}
+          *Tag:* \`${TAG}\`
+          *Actor:* ${ACTOR}
+          *Commit:* ${COMMIT_MSG}"
+
+          if [ -n "$BTN_URL" ]; then
+            jq -n \
+              --arg chat_id "$CHAT_ID" \
+              --arg text "$TEXT" \
+              --arg btn_text "$BTN_TEXT" \
+              --arg btn_url "$BTN_URL" \
+              '{
+                chat_id: $chat_id,
+                text: $text,
+                parse_mode: "Markdown",
+                reply_markup: { inline_keyboard: [[{ text: $btn_text, url: $btn_url }]] }
+              }' > payload.json
+          else
+            jq -n \
+              --arg chat_id "$CHAT_ID" \
+              --arg text "$TEXT" \
+              '{ chat_id: $chat_id, text: $text, parse_mode: "Markdown" }' > payload.json
+          fi
+
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d @payload.json
