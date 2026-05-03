@@ -172,7 +172,7 @@ jobs:
           TAG_LINE=""
           [ "$ACTION" != "restart" ] && TAG_LINE="*Tag:* \`${TAG}\`"
 
-          TEXT="✅ *${ACTION_LABEL} Successful\!*
+          TEXT="✅ *${ACTION_LABEL} Successful!*
 
           *Repository:* ${REPO}
           ${TAG_LINE}
@@ -205,7 +205,7 @@ jobs:
             TAG_LINE="*Action:* Please check the logs."
           fi
 
-          TEXT="❌ *${ACTION_LABEL} Failed\!*
+          TEXT="❌ *${ACTION_LABEL} Failed!*
 
           *Repository:* ${REPO}
           ${TAG_LINE}"

@@ -209,7 +209,7 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
-          TEXT="✅ *Build \& Push Successful\!*
+          TEXT="✅ *Build & Push Successful!*
 
           *Repository:* ${REPO}
           *Tag:* \`${TAG}\`
