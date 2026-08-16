@@ -15,6 +15,16 @@ on:
         type: number
         default: 600
         description: Max seconds to wait for rollout completion
+      notify:
+        required: false
+        type: boolean
+        default: false
+        description: Send a Telegram notification on success and failure
+    secrets:
+      TELEGRAM_CHAT_ID:
+        required: false
+      TELEGRAM_BOT_TOKEN:
+        required: false
 
 jobs:
   restart:
@@ -33,6 +43,7 @@ jobs:
             core.setOutput('token', token);
 
       - name: Restart via deploy gateway
+        id: restart
         env:
           GATEWAY_TOKEN: ${{ steps.oidc.outputs.token }}
           NS: ${{ inputs.namespace }}
@@ -47,11 +58,13 @@ jobs:
           body=$(echo "$resp" | head -n -1)
           code=$(echo "$resp" | tail -n 1)
           if [ "$code" != "202" ]; then
+            echo "status=rejected" >> "$GITHUB_OUTPUT"
             echo "gateway returned $code: $body" >&2
             exit 1
           fi
           op_id=$(echo "$body" | jq -r '.operation_id')
           echo "operation: $op_id"
+          echo "operation-id=$op_id" >> "$GITHUB_OUTPUT"
 
           deadline=$(( SECONDS + TIMEOUT ))
           while [ $SECONDS -lt $deadline ]; do
@@ -64,6 +77,7 @@ jobs:
             # yields "null", falls through the case, and the job would spin to
             # the deadline reporting "timed out" while the op actually succeeded.
             if [ "$code" != "200" ]; then
+              echo "status=unreachable" >> "$GITHUB_OUTPUT"
               if [ "$code" = "401" ]; then
                 echo "gateway auth failed during polling (token expired?)" >&2
               else
@@ -74,11 +88,83 @@ jobs:
             status=$(echo "$body" | jq -r '.status')
             echo "status: $status"
             case "$status" in
-              succeeded) exit 0 ;;
+              succeeded)
+                echo "status=succeeded" >> "$GITHUB_OUTPUT"
+                exit 0 ;;
               failed|timeout|denied)
+                echo "status=$status" >> "$GITHUB_OUTPUT"
                 echo "$body" | jq . >&2
                 exit 1 ;;
             esac
           done
+          echo "status=timed-out" >> "$GITHUB_OUTPUT"
           echo "timed out waiting for operation $op_id" >&2
           exit 1
+
+      - name: Send success notification
+        if: ${{ inputs.notify == true && success() }}
+        env:
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          NS: ${{ inputs.namespace }}
+          DEP: ${{ inputs.deployment }}
+          OP_ID: ${{ steps.restart.outputs.operation-id }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TEXT=$(printf '%s\n' \
+            "✅ *Restart Successful!*" \
+            "" \
+            "*Repository:* ${REPO}" \
+            "*Namespace:* \`${NS}\`" \
+            "*Deployment:* \`${DEP}\`" \
+            "*Operation:* \`${OP_ID}\`" \
+            "*Actor:* ${ACTOR}" \
+            "" \
+            "[View run](${RUN_URL})")
+
+          jq -n \
+            --arg chat_id "$CHAT_ID" \
+            --arg text "$TEXT" \
+            '{ chat_id: $chat_id, text: $text, parse_mode: "Markdown" }' | \
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d @-
+
+      - name: Send failure notification
+        if: ${{ inputs.notify == true && failure() }}
+        env:
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          NS: ${{ inputs.namespace }}
+          DEP: ${{ inputs.deployment }}
+          OP_ID: ${{ steps.restart.outputs.operation-id }}
+          STATUS: ${{ steps.restart.outputs.status }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Empty when the job died before the gateway answered (e.g. OIDC step).
+          [ -z "$OP_ID" ] && OP_ID="n/a"
+          [ -z "$STATUS" ] && STATUS="unknown"
+
+          TEXT=$(printf '%s\n' \
+            "❌ *Restart Failed!*" \
+            "" \
+            "*Repository:* ${REPO}" \
+            "*Namespace:* \`${NS}\`" \
+            "*Deployment:* \`${DEP}\`" \
+            "*Operation:* \`${OP_ID}\`" \
+            "*Status:* ${STATUS}" \
+            "*Actor:* ${ACTOR}" \
+            "" \
+            "[View run](${RUN_URL})")
+
+          jq -n \
+            --arg chat_id "$CHAT_ID" \
+            --arg text "$TEXT" \
+            '{ chat_id: $chat_id, text: $text, parse_mode: "Markdown" }' | \
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d @-
