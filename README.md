@@ -5,6 +5,7 @@ Shared GitHub Actions workflows for building, deploying and restarting TunCloud 
 | Workflow | Purpose |
 | --- | --- |
 | [`ci-build-push.yml`](.github/workflows/ci-build-push.yml) | Version bump, build and push container images |
+| [`ci-build-push-ghcr.yml`](.github/workflows/ci-build-push-ghcr.yml) | Same, for GHCR with `GITHUB_TOKEN` (no registry secrets) and per-app versions in monorepos |
 | [`rollout-deployment.yml`](.github/workflows/rollout-deployment.yml) | Update a deployment's image through the TunCloud deploy gateway |
 | [`restart-deployment.yml`](.github/workflows/restart-deployment.yml) | Restart a deployment through the TunCloud deploy gateway |
 | [`cd-deploy.yml`](.github/workflows/cd-deploy.yml) | Deploy or restart with `kubectl` over a Cloudflare tunnel |
@@ -24,6 +25,75 @@ Shared GitHub Actions workflows for building, deploying and restarting TunCloud 
 Prefer the gateway workflows (`rollout-deployment` / `restart-deployment`) for new
 services — they need no cluster credentials at all. Use `cd-deploy` when you must update
 several containers atomically or want the built-in rollback.
+
+---
+
+## `ci-build-push-ghcr.yml`
+
+Builds one image with Buildx and pushes it to `ghcr.io/<owner>/<image-name>`. It logs in with
+the run's own `GITHUB_TOKEN`, so there are **no registry secrets** to create or rotate.
+
+How it differs from `ci-build-push.yml`:
+
+| | `ci-build-push` | `ci-build-push-ghcr` |
+| --- | --- | --- |
+| Registry auth | username/token secrets | `GITHUB_TOKEN` (GHCR only) |
+| Git tags | repo-wide `vX.Y.Z` | `<tag-prefix>vX.Y.Z`: one series per app |
+| Auto bump reads | every commit in the repo | only commits under `commit-path` |
+| Git tag created | before the build | after a successful push, so failed builds don't use up a version |
+| Multi-arch | runner's arch only | `platforms`, e.g. `linux/amd64,linux/arm64` |
+| Concurrent runs | can race for the same tag | serialized per repo + image |
+
+### Inputs
+
+| Name | Default | Description |
+| --- | --- | --- |
+| `image-name` | — (required) | Image name under `ghcr.io/<owner>/` |
+| `context` | `.` | Build context directory |
+| `dockerfile` | `<context>/Dockerfile` | Dockerfile/Containerfile path, relative to the repo root |
+| `platforms` | `linux/arm64` | Target platforms (the TunCloud cluster is arm64) |
+| `runner` | `ubuntu-24.04-arm` | Runner label |
+| `tag-prefix` | `''` | e.g. `order-saga/` gives git tags `order-saga/v1.2.3`. The image tag stays `v1.2.3` |
+| `commit-path` | `''` | Only commits touching this path drive `bump: auto` |
+| `bump` | `auto` | `auto` (conventional commits), `patch`, `minor`, `major` |
+| `push-latest` | `true` | Also push `:latest` |
+
+Outputs: `tag` (`v1.2.3`), `image` (`ghcr.io/owner/name:v1.2.3`), `digest`.
+
+### Usage: one app inside a monorepo
+
+```yaml
+on:
+  push:
+    branches: [main, master]
+    paths: ['apps/order-saga/**']
+
+jobs:
+  build:
+    uses: tuncloud/workflow/.github/workflows/ci-build-push-ghcr.yml@main
+    permissions:
+      contents: write   # git tag
+      packages: write   # GHCR push
+    with:
+      image-name: order-saga
+      context: apps/order-saga
+      dockerfile: apps/order-saga/Containerfile
+      tag-prefix: order-saga/
+      commit-path: apps/order-saga
+```
+
+Chain [`rollout-deployment.yml`](#rollout-deploymentyml) with
+`image: ${{ needs.build.outputs.image }}` to deploy the new build.
+
+Notes:
+
+- **The caller must grant both permissions.** A called workflow can't raise permissions its
+  caller didn't give, so without them the run fails at startup.
+- **New GHCR packages start private.** The cluster can't pull them until you either make the
+  package public (package → Settings → Change visibility) or add an `imagePullSecret`.
+- For fast multi-arch Go builds, cross-compile in the Containerfile
+  (`FROM --platform=$BUILDPLATFORM ...` plus `GOOS=$TARGETOS GOARCH=$TARGETARCH`) instead of
+  relying on QEMU emulation.
 
 ---
 

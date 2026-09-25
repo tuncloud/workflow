@@ -1,0 +1,205 @@
+name: CI - Build and Push (GHCR)
+
+# Builds one image and pushes it to GitHub Container Registry using the run's GITHUB_TOKEN,
+# so no registry secrets are needed. Built for monorepos: each app gets its own git tag
+# series (`<tag-prefix>vX.Y.Z`), with the version bump computed only from commits under `commit-path`.
+#
+# The calling job MUST grant `contents: write` (git tag) and `packages: write` (push).
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: 'Image name under ghcr.io/<owner>/, e.g. "order-saga"'
+        required: true
+        type: string
+      context:
+        description: 'Build context directory'
+        required: false
+        type: string
+        default: '.'
+      dockerfile:
+        description: 'Path to the Dockerfile/Containerfile. Empty = <context>/Dockerfile'
+        required: false
+        type: string
+        default: ''
+      platforms:
+        description: 'Comma-separated target platforms, e.g. "linux/arm64" or "linux/amd64,linux/arm64"'
+        required: false
+        type: string
+        default: 'linux/arm64'
+      runner:
+        description: 'GitHub Actions runner label (use an arm runner for native arm64 builds)'
+        required: false
+        type: string
+        default: 'ubuntu-24.04-arm'
+      tag-prefix:
+        description: 'Git tag prefix for this app, e.g. "order-saga/" -> git tag order-saga/v1.2.3. Empty = v1.2.3'
+        required: false
+        type: string
+        default: ''
+      commit-path:
+        description: 'Only commits touching this path drive the auto bump. Empty = whole repo'
+        required: false
+        type: string
+        default: ''
+      bump:
+        description: 'Semver bump strategy: auto (conventional commits), patch, minor, major'
+        required: false
+        type: string
+        default: 'auto'
+      push-latest:
+        description: 'Also push the :latest tag'
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      tag:
+        description: 'Image tag that was pushed (e.g. v1.2.3)'
+        value: ${{ jobs.build-push.outputs.tag }}
+      image:
+        description: 'Full image reference with tag (e.g. ghcr.io/tuncloud/order-saga:v1.2.3)'
+        value: ${{ jobs.build-push.outputs.image }}
+      digest:
+        description: 'Image manifest digest'
+        value: ${{ jobs.build-push.outputs.digest }}
+
+jobs:
+  build-push:
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: write   # create & push the git tag
+      packages: write   # push to ghcr.io with GITHUB_TOKEN
+    # Serialize runs per app so two pushes to main can't compute the same next version.
+    concurrency:
+      group: ci-build-push-ghcr-${{ github.repository }}-${{ inputs.image-name }}
+      cancel-in-progress: false
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      image: ${{ steps.names.outputs.image }}:${{ steps.version.outputs.tag }}
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags for conventional-commit analysis
+
+      - name: Validate inputs and resolve image name
+        id: names
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+          BUMP: ${{ inputs.bump }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          [[ "$IMAGE_NAME" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || { echo "::error::invalid image-name '$IMAGE_NAME'"; exit 1; }
+          [[ -z "$TAG_PREFIX" || "$TAG_PREFIX" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::invalid tag-prefix '$TAG_PREFIX'"; exit 1; }
+          [[ "$BUMP" =~ ^(auto|patch|minor|major)$ ]] || { echo "::error::invalid bump '$BUMP'"; exit 1; }
+          # GHCR requires lowercase repository names.
+          echo "image=ghcr.io/${OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine next version
+        id: version
+        env:
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
+          COMMIT_PATH: ${{ inputs.commit-path }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          LATEST=$(git tag -l "${TAG_PREFIX}v[0-9]*.[0-9]*.[0-9]*" --sort=-v:refname | head -1)
+          PATHSPEC=()
+          [ -n "$COMMIT_PATH" ] && PATHSPEC=(-- "$COMMIT_PATH")
+
+          if [ -z "$LATEST" ]; then
+            NEXT="v0.1.0"
+          else
+            VERSION="${LATEST#"${TAG_PREFIX}"v}"
+            IFS=. read -r MAJOR MINOR PATCH <<< "$VERSION"
+
+            if [ "$BUMP" = "auto" ]; then
+              COMMITS=$(git log "${LATEST}..HEAD" --pretty=format:"%s%n%b" "${PATHSPEC[@]}" || true)
+              if echo "$COMMITS" | grep -qE "BREAKING[- ]CHANGE|^[a-z]+(\(.+\))?!:"; then
+                BUMP="major"
+              elif echo "$COMMITS" | grep -qE "^feat(\(.+\))?:"; then
+                BUMP="minor"
+              else
+                BUMP="patch"
+              fi
+            fi
+            case "$BUMP" in
+              major) NEXT="v$((MAJOR+1)).0.0" ;;
+              minor) NEXT="v${MAJOR}.$((MINOR+1)).0" ;;
+              *)     NEXT="v${MAJOR}.${MINOR}.$((PATCH+1))" ;;
+            esac
+          fi
+
+          echo "tag=${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "git-tag=${TAG_PREFIX}${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "Latest: ${LATEST:-<none>}  ->  next: ${TAG_PREFIX}${NEXT}"
+
+      - name: Image tags
+        id: tags
+        env:
+          IMAGE: ${{ steps.names.outputs.image }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PUSH_LATEST: ${{ inputs.push-latest }}
+        run: |
+          {
+            echo "list<<EOF"
+            echo "${IMAGE}:${TAG}"
+            [ "$PUSH_LATEST" = "true" ] && echo "${IMAGE}:latest"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # Needed only when a platform differs from the runner's; harmless otherwise.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.tag }}
+          cache-from: type=gha,scope=${{ inputs.image-name }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image-name }}
+
+      # Tag only after a successful push, so a failed build never burns a version.
+      - name: Create and push git tag
+        env:
+          GIT_TAG: ${{ steps.version.outputs.git-tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$GIT_TAG" -m "$GIT_TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$GIT_TAG"
+
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.names.outputs.image }}
+          TAG: ${{ steps.version.outputs.tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          GIT_TAG: ${{ steps.version.outputs.git-tag }}
+        run: |
+          {
+            echo "### Pushed \`${IMAGE}:${TAG}\`"
+            echo "- digest: \`${DIGEST}\`"
+            echo "- git tag: \`${GIT_TAG}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
