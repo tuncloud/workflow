@@ -5,7 +5,7 @@ Shared GitHub Actions workflows for building, deploying and restarting TunCloud 
 | Workflow | Purpose |
 | --- | --- |
 | [`ci-build-push.yml`](.github/workflows/ci-build-push.yml) | Version bump, build and push container images |
-| [`ci-build-push-ghcr.yml`](.github/workflows/ci-build-push-ghcr.yml) | Same, for GHCR with `GITHUB_TOKEN` (no registry secrets) and per-app versions in monorepos |
+| [`ci-build-push-ghcr.yml`](.github/workflows/ci-build-push-ghcr.yml) | Same, for GHCR with `GITHUB_TOKEN` (no registry secrets) and per-app versions in monorepos; signs the image and attests SBOM, vuln report and SLSA provenance with cosign |
 | [`rollout-deployment.yml`](.github/workflows/rollout-deployment.yml) | Update a deployment's image through the TunCloud deploy gateway |
 | [`restart-deployment.yml`](.github/workflows/restart-deployment.yml) | Restart a deployment through the TunCloud deploy gateway |
 | [`cd-deploy.yml`](.github/workflows/cd-deploy.yml) | Deploy or restart with `kubectl` over a Cloudflare tunnel |
@@ -32,6 +32,8 @@ several containers atomically or want the built-in rollback.
 
 Builds one image with Buildx and pushes it to `ghcr.io/<owner>/<image-name>`. It logs in with
 the run's own `GITHUB_TOKEN`, so there are **no registry secrets** to create or rotate.
+Every pushed digest is signed with cosign and carries an SBOM, a vulnerability report and SLSA
+provenance as cosign attestations — see [Signing and attestations](#signing-and-attestations).
 
 How it differs from `ci-build-push.yml`:
 
@@ -43,6 +45,7 @@ How it differs from `ci-build-push.yml`:
 | Git tag created | before the build | after a successful push, so failed builds don't use up a version |
 | Multi-arch | runner's arch only | `platforms`, e.g. `linux/amd64,linux/arm64` |
 | Concurrent runs | can race for the same tag | serialized per repo + image |
+| Signing / SBOM / provenance | no | cosign signature + 3 attestations |
 
 ### Inputs
 
@@ -56,7 +59,11 @@ How it differs from `ci-build-push.yml`:
 | `tag-prefix` | `''` | e.g. `order-saga/` gives git tags `order-saga/v1.2.3`. The image tag stays `v1.2.3` |
 | `commit-path` | `''` | Only commits touching this path drive `bump: auto` |
 | `bump` | `auto` | `auto` (conventional commits), `patch`, `minor`, `major` |
-| `push-latest` | `true` | Also push `:latest` |
+| `push-latest` | `true` | Also push `:latest`, moved only after the digest is signed and attested |
+| `sbom-format` | `cyclonedx` | `cyclonedx` or `spdx-json` |
+| `fail-on-severity` | `''` | e.g. `CRITICAL,HIGH`: fail before signing if any match. Empty = report only |
+| `ignore-unfixed` | `false` | Skip vulnerabilities with no fixed version when applying `fail-on-severity` |
+| `trivy-version` | `v0.74.0` | Trivy release used for the SBOM and the scan |
 
 Outputs: `tag` (`v1.2.3`), `image` (`ghcr.io/owner/name:v1.2.3`), `digest`.
 
@@ -73,7 +80,8 @@ jobs:
     uses: tuncloud/workflow/.github/workflows/ci-build-push-ghcr.yml@main
     permissions:
       contents: write   # git tag
-      packages: write   # GHCR push
+      packages: write   # GHCR push (image, signature, attestations)
+      id-token: write   # keyless cosign signing
     with:
       image-name: order-saga
       context: apps/order-saga
@@ -87,13 +95,69 @@ Chain [`rollout-deployment.yml`](#rollout-deploymentyml) with
 
 Notes:
 
-- **The caller must grant both permissions.** A called workflow can't raise permissions its
-  caller didn't give, so without them the run fails at startup.
+- **The caller must grant all three permissions.** A called workflow can't raise permissions its
+  caller didn't give, so without them the run fails at startup. Existing callers that only
+  grant `contents` and `packages` must add `id-token: write`.
 - **New GHCR packages start private.** The cluster can't pull them until you either make the
   package public (package → Settings → Change visibility) or add an `imagePullSecret`.
 - For fast multi-arch Go builds, cross-compile in the Containerfile
   (`FROM --platform=$BUILDPLATFORM ...` plus `GOOS=$TARGETOS GOARCH=$TARGETARCH`) instead of
   relying on QEMU emulation.
+
+### Signing and attestations
+
+After the push, every step works on the immutable digest, in this order:
+
+1. **Scan** — Trivy scans the image once (first entry of `platforms`) into a JSON report. The
+   SBOM (`sbom-format`) and the cosign vulnerability predicate are both converted from that
+   report, so they describe the same package set. A severity table goes to the job summary.
+2. **Gate** — when `fail-on-severity` is set and anything matches, the job stops here. The
+   image stays pushed under its version tag but **unsigned**; `:latest` and the git tag don't move.
+3. **Provenance** — an SLSA v1 predicate in GitHub's
+   `https://actions.github.io/buildtypes/workflow/v1` build type. Builder identity, caller
+   workflow and commits are read from the job's OIDC token, so the provenance names this
+   reusable workflow (and its commit) as the builder, not the caller.
+4. **Sign** — `cosign sign --recursive`, keyless through Fulcio/Rekor. For multi-arch indexes,
+   each per-platform manifest is signed too.
+5. **Attest** — `cosign attest` with predicate types `cyclonedx` (or `spdxjson`), `vuln` and
+   `slsaprovenance1`.
+6. `:latest` is re-pointed at the signed digest, then the git tag is created.
+
+The raw files (`trivy-report.json`, `sbom.json`, `vuln.json`, `provenance.json`) are also
+uploaded as the `supply-chain-<image-name>-<tag>` workflow artifact for 30 days.
+
+The certificate identity is this workflow file at the ref the caller used, e.g.
+`https://github.com/tuncloud/workflow/.github/workflows/ci-build-push-ghcr.yml@refs/heads/main`.
+The job summary prints the exact value. To verify:
+
+```sh
+IMAGE=ghcr.io/tuncloud/order-saga@sha256:...
+ID='^https://github\.com/tuncloud/workflow/\.github/workflows/ci-build-push-ghcr\.yml@'
+ISSUER=https://token.actions.githubusercontent.com
+
+cosign verify --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER" "$IMAGE"
+
+for t in slsaprovenance1 cyclonedx vuln; do
+  cosign verify-attestation --type "$t" \
+    --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER" "$IMAGE" > /dev/null
+done
+
+# Which repo/commit built it:
+cosign verify-attestation --type slsaprovenance1 \
+  --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISSUER" "$IMAGE" \
+  | jq -r '.payload | @base64d | fromjson | .predicate.buildDefinition.resolvedDependencies[0]'
+```
+
+Pinning the identity to this workflow only proves the image came from *some* repo calling it.
+To accept only one service, also check the provenance's `resolvedDependencies[0].uri`, or
+enforce both in a cluster admission policy (Sigstore policy-controller / Kyverno).
+
+Limits:
+
+- Trivy covers one platform of a multi-arch index; the SBOM and vuln report describe that
+  platform, while the attestations are attached to the index digest.
+- The vulnerability attestation is a snapshot at build time. Re-scan deployed images on a
+  schedule to catch CVEs published later.
 
 ---
 

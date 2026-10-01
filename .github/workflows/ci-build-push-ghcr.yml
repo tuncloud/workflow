@@ -4,7 +4,11 @@ name: CI - Build and Push (GHCR)
 # so no registry secrets are needed. Built for monorepos: each app gets its own git tag
 # series (`<tag-prefix>vX.Y.Z`), with the version bump computed only from commits under `commit-path`.
 #
-# The calling job MUST grant `contents: write` (git tag) and `packages: write` (push).
+# Supply chain: the pushed digest is signed with cosign (keyless, GitHub OIDC) and carries three
+# cosign attestations — a Trivy SBOM, a Trivy vulnerability report and SLSA v1 build provenance.
+#
+# The calling job MUST grant `contents: write` (git tag), `packages: write` (push) and
+# `id-token: write` (keyless signing).
 
 on:
   workflow_call:
@@ -49,10 +53,30 @@ on:
         type: string
         default: 'auto'
       push-latest:
-        description: 'Also push the :latest tag'
+        description: 'Also push the :latest tag (moved only after the image is signed and attested)'
         required: false
         type: boolean
         default: true
+      sbom-format:
+        description: 'SBOM format: cyclonedx or spdx-json'
+        required: false
+        type: string
+        default: 'cyclonedx'
+      fail-on-severity:
+        description: 'Comma-separated severities that fail the build before signing, e.g. "CRITICAL,HIGH". Empty = report only'
+        required: false
+        type: string
+        default: ''
+      ignore-unfixed:
+        description: 'Ignore vulnerabilities without a fixed version when applying fail-on-severity'
+        required: false
+        type: boolean
+        default: false
+      trivy-version:
+        description: 'Trivy release to install'
+        required: false
+        type: string
+        default: 'v0.74.0'
     outputs:
       tag:
         description: 'Image tag that was pushed (e.g. v1.2.3)'
@@ -69,7 +93,8 @@ jobs:
     runs-on: ${{ inputs.runner }}
     permissions:
       contents: write   # create & push the git tag
-      packages: write   # push to ghcr.io with GITHUB_TOKEN
+      packages: write   # push image, signature and attestations to ghcr.io with GITHUB_TOKEN
+      id-token: write   # OIDC token for keyless cosign signing and the provenance builder identity
     # Serialize runs per app so two pushes to main can't compute the same next version.
     concurrency:
       group: ci-build-push-ghcr-${{ github.repository }}-${{ inputs.image-name }}
@@ -91,13 +116,26 @@ jobs:
           IMAGE_NAME: ${{ inputs.image-name }}
           TAG_PREFIX: ${{ inputs.tag-prefix }}
           BUMP: ${{ inputs.bump }}
+          SBOM_FORMAT: ${{ inputs.sbom-format }}
+          FAIL_ON: ${{ inputs.fail-on-severity }}
+          PLATFORMS: ${{ inputs.platforms }}
           OWNER: ${{ github.repository_owner }}
         run: |
+          SEV='(UNKNOWN|LOW|MEDIUM|HIGH|CRITICAL)'
           [[ "$IMAGE_NAME" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || { echo "::error::invalid image-name '$IMAGE_NAME'"; exit 1; }
           [[ -z "$TAG_PREFIX" || "$TAG_PREFIX" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::invalid tag-prefix '$TAG_PREFIX'"; exit 1; }
           [[ "$BUMP" =~ ^(auto|patch|minor|major)$ ]] || { echo "::error::invalid bump '$BUMP'"; exit 1; }
+          [[ -z "$FAIL_ON" || "$FAIL_ON" =~ ^${SEV}(,${SEV})*$ ]] || { echo "::error::invalid fail-on-severity '$FAIL_ON'"; exit 1; }
+          case "$SBOM_FORMAT" in
+            cyclonedx) echo "sbom-type=cyclonedx" >> "$GITHUB_OUTPUT" ;;
+            spdx-json) echo "sbom-type=spdxjson"  >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::invalid sbom-format '$SBOM_FORMAT'"; exit 1 ;;
+          esac
           # GHCR requires lowercase repository names.
           echo "image=ghcr.io/${OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          # Trivy scans one platform of a multi-arch index: the first one listed.
+          SCAN_PLATFORM="${PLATFORMS%%,*}"
+          echo "scan-platform=${SCAN_PLATFORM// /}" >> "$GITHUB_OUTPUT"
 
       - name: Determine next version
         id: version
@@ -137,20 +175,6 @@ jobs:
           echo "git-tag=${TAG_PREFIX}${NEXT}" >> "$GITHUB_OUTPUT"
           echo "Latest: ${LATEST:-<none>}  ->  next: ${TAG_PREFIX}${NEXT}"
 
-      - name: Image tags
-        id: tags
-        env:
-          IMAGE: ${{ steps.names.outputs.image }}
-          TAG: ${{ steps.version.outputs.tag }}
-          PUSH_LATEST: ${{ inputs.push-latest }}
-        run: |
-          {
-            echo "list<<EOF"
-            echo "${IMAGE}:${TAG}"
-            [ "$PUSH_LATEST" = "true" ] && echo "${IMAGE}:latest"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
       # Needed only when a platform differs from the runner's; harmless otherwise.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -173,7 +197,8 @@ jobs:
           file: ${{ inputs.dockerfile }}
           platforms: ${{ inputs.platforms }}
           push: true
-          tags: ${{ steps.tags.outputs.list }}
+          # :latest is added only after signing, so it never points at an unsigned image.
+          tags: ${{ steps.names.outputs.image }}:${{ steps.version.outputs.tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -181,7 +206,158 @@ jobs:
           cache-from: type=gha,scope=${{ inputs.image-name }}
           cache-to: type=gha,mode=max,scope=${{ inputs.image-name }}
 
-      # Tag only after a successful push, so a failed build never burns a version.
+
+      # ---------------------------------------------------------------------------------------
+      # Supply chain: everything below targets the immutable digest, never a tag.
+      # ---------------------------------------------------------------------------------------
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ inputs.trivy-version }}
+          cache: true
+
+      # One scan produces everything; the SBOM and the vuln report are converted from it, so
+      # they describe exactly the same package set.
+      - name: Scan image with Trivy
+        id: scan
+        env:
+          REF: ${{ steps.names.outputs.image }}@${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ steps.names.outputs.scan-platform }}
+          SBOM_FORMAT: ${{ inputs.sbom-format }}
+        run: |
+          mkdir -p supply-chain
+          trivy image --quiet --platform "$PLATFORM" --scanners vuln --list-all-pkgs \
+            --format json --output supply-chain/trivy-report.json "$REF"
+          trivy convert --quiet --format "$SBOM_FORMAT" --output supply-chain/sbom.json supply-chain/trivy-report.json
+          trivy convert --quiet --format cosign-vuln --output supply-chain/vuln.json supply-chain/trivy-report.json
+
+          {
+            echo "### Vulnerabilities (\`${PLATFORM}\`)"
+            echo "| Severity | Total | Fixable |"
+            echo "| --- | --- | --- |"
+            for s in CRITICAL HIGH MEDIUM LOW UNKNOWN; do
+              jq -r --arg s "$s" '[.Results[]?.Vulnerabilities[]? | select(.Severity == $s)]
+                | "| \($s) | \(length) | \(map(select((.FixedVersion // "") != "")) | length) |"' \
+                supply-chain/trivy-report.json
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Fails before signing: a rejected image stays unsigned, :latest and the git tag don't move.
+      - name: Enforce vulnerability policy
+        if: ${{ inputs.fail-on-severity != '' }}
+        env:
+          FAIL_ON: ${{ inputs.fail-on-severity }}
+          IGNORE_UNFIXED: ${{ inputs.ignore-unfixed }}
+        run: |
+          COUNT=$(jq --arg sevs "$FAIL_ON" --argjson unfixed "$IGNORE_UNFIXED" '
+            ($sevs | split(",")) as $blocked
+            | [.Results[]?.Vulnerabilities[]?
+               | select(.Severity as $s | $blocked | index($s))
+               | select(($unfixed | not) or ((.FixedVersion // "") != ""))]
+            | length' supply-chain/trivy-report.json)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "::error::${COUNT} vulnerabilities at ${FAIL_ON} — image left unsigned"
+            exit 1
+          fi
+
+      # SLSA v1 provenance in GitHub's own workflow buildType. Identity fields come from the
+      # job's OIDC token rather than the github context, because inside a reusable workflow only
+      # the token knows which workflow file (and commit) actually ran the build.
+      - name: Generate SLSA provenance
+        id: provenance
+        env:
+          SERVER: ${{ github.server_url }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          CONTEXT: ${{ inputs.context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          PLATFORMS: ${{ inputs.platforms }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          TOKEN=$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=slsa-provenance" | jq -r .value)
+          echo "::add-mask::${TOKEN}"
+          PAYLOAD=$(cut -d. -f2 <<< "$TOKEN" | tr '_-' '/+')
+          while (( ${#PAYLOAD} % 4 )); do PAYLOAD+="="; done
+          CLAIMS=$(base64 -d <<< "$PAYLOAD")
+
+          jq -n --argjson c "$CLAIMS" --arg server "$SERVER" \
+            --arg image_name "$IMAGE_NAME" --arg context "$CONTEXT" --arg dockerfile "$DOCKERFILE" \
+            --arg platforms "$PLATFORMS" --arg tag "$TAG" '
+            ($c.job_workflow_ref | capture("^(?<repo>[^/]+/[^/]+)/(?<path>[^@]+)@(?<ref>.+)$")) as $builder
+            | {
+                buildDefinition: {
+                  buildType: "https://actions.github.io/buildtypes/workflow/v1",
+                  externalParameters: {
+                    workflow: {
+                      ref: $c.ref,
+                      repository: "\($server)/\($c.repository)",
+                      path: ($c.workflow_ref | capture("^[^/]+/[^/]+/(?<p>[^@]+)@").p)
+                    },
+                    inputs: { "image-name": $image_name, context: $context, dockerfile: $dockerfile,
+                              platforms: $platforms, tag: $tag }
+                  },
+                  internalParameters: {
+                    github: {
+                      event_name: $c.event_name,
+                      repository_id: $c.repository_id,
+                      repository_owner_id: $c.repository_owner_id,
+                      runner_environment: $c.runner_environment
+                    }
+                  },
+                  resolvedDependencies: [
+                    { uri: "git+\($server)/\($c.repository)@\($c.ref)", digest: { gitCommit: $c.sha } },
+                    { uri: "git+\($server)/\($builder.repo)@\($builder.ref)", digest: { gitCommit: $c.job_workflow_sha } }
+                  ]
+                },
+                runDetails: {
+                  builder: { id: "\($server)/\($c.job_workflow_ref)" },
+                  metadata: { invocationId: "\($server)/\($c.repository)/actions/runs/\($c.run_id)/attempts/\($c.run_attempt)" }
+                }
+              }' > supply-chain/provenance.json
+          echo "builder-identity=${SERVER}/$(jq -r .job_workflow_ref <<< "$CLAIMS")" >> "$GITHUB_OUTPUT"
+
+      # Keyless: the Fulcio certificate binds the signature to this workflow file
+      # (job_workflow_ref), which is what consumers pin with --certificate-identity.
+      # --recursive also signs each per-platform manifest inside a multi-arch index.
+      - name: Sign image
+        env:
+          REF: ${{ steps.names.outputs.image }}@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes --recursive "$REF"
+
+      - name: Attest SBOM, vulnerability report and provenance
+        env:
+          REF: ${{ steps.names.outputs.image }}@${{ steps.build.outputs.digest }}
+          SBOM_TYPE: ${{ steps.names.outputs.sbom-type }}
+        run: |
+          cosign attest --yes --type "$SBOM_TYPE"     --predicate supply-chain/sbom.json       "$REF"
+          cosign attest --yes --type vuln             --predicate supply-chain/vuln.json       "$REF"
+          cosign attest --yes --type slsaprovenance1  --predicate supply-chain/provenance.json "$REF"
+
+      - name: Upload supply-chain reports
+        if: ${{ always() && steps.scan.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: supply-chain-${{ inputs.image-name }}-${{ steps.version.outputs.tag }}
+          path: supply-chain/
+          retention-days: 30
+
+      # Re-point :latest at the already-signed digest. imagetools copies a single index
+      # source as-is; the check guards against it ever being rewrapped into a new digest.
+      - name: Tag latest
+        if: ${{ inputs.push-latest }}
+        env:
+          IMAGE: ${{ steps.names.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          docker buildx imagetools create --tag "${IMAGE}:latest" "${IMAGE}@${DIGEST}"
+          GOT=$(docker buildx imagetools inspect "${IMAGE}:latest" --format '{{json .Manifest}}' | jq -r .digest)
+          [ "$GOT" = "$DIGEST" ] || { echo "::error::${IMAGE}:latest is ${GOT}, expected ${DIGEST}"; exit 1; }
+
+      # Tag only after a successful push and signing, so a failed build never burns a version.
       - name: Create and push git tag
         env:
           GIT_TAG: ${{ steps.version.outputs.git-tag }}
@@ -197,9 +373,20 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
           DIGEST: ${{ steps.build.outputs.digest }}
           GIT_TAG: ${{ steps.version.outputs.git-tag }}
+          SBOM_TYPE: ${{ steps.names.outputs.sbom-type }}
+          IDENTITY: ${{ steps.provenance.outputs.builder-identity }}
         run: |
           {
             echo "### Pushed \`${IMAGE}:${TAG}\`"
             echo "- digest: \`${DIGEST}\`"
             echo "- git tag: \`${GIT_TAG}\`"
+            echo "- signed + attested: \`${SBOM_TYPE}\`, \`vuln\`, \`slsaprovenance1\`"
+            echo ""
+            echo "Verify:"
+            echo '```sh'
+            echo "cosign verify \\"
+            echo "  --certificate-identity '${IDENTITY}' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  ${IMAGE}@${DIGEST}"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
